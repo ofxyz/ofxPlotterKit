@@ -6,7 +6,8 @@ meta:
 	ADDON_URL = https://github.com/ofkitty/ofxPlotterKit
 
 common:
-	ADDON_DEPENDENCIES = ofxPlotter ofxGrbl ofxKit
+	# ofxPixelPlotter: PlotterEffectGraphECS / EffectPhase used by GcodeGeneratorPanel
+	ADDON_DEPENDENCIES = ofxPlotter ofxPixelPlotter ofxGrbl ofxKit ofxDocumentKit ofxVectorKit ofxImGuiStyle ofxImGuiMarkdown ofxImGuiTextEdit ofxPlotGenerators ofxPlotGeneratorsLSystem ofxPlotProcessors ofxGCode
 
 linux64:
 vs:

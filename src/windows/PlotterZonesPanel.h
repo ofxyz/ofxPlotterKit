@@ -1,7 +1,6 @@
 #pragma once
 
 #include "PlotterZones.h"
-#include "PlotterZoneComponents.h"
 
 #include <MachinePrefs.h>
 #include <entt.hpp>
@@ -28,7 +27,7 @@ namespace plotter::kit {
 ///   m_zonesPanel.setRegistry(&ofkitty::runtime().registry());
 ///   m_zonesPanel.setOnSelectEntity([](entt::entity e){ ofkitty::runtime().select(e); });
 ///   m_zonesPanel.setGetSelectedEntity([]{ return ofkitty::runtime().selected(); });
-///   grbl::kit::registerWindow(runtime, m_zonesPanel);
+///   plotter::kit::registerWindow(runtime, m_zonesPanel);
 class PlotterZonesPanel {
 public:
     void setRegistry(entt::registry* reg)               { m_registry = reg; }
@@ -51,8 +50,12 @@ public:
     bool        isVisible()  const { return false; }
     void draw(bool& visible);
 
+    /// Optional ImGui::Begin title (include ###id for ofxKit docking). Default: name().
+    void setImGuiWindowTitle(std::string title) { m_imguiWindowTitle = std::move(title); }
+
     // ── Embeddable sections (no Begin/End) ────────────────────────────────────
-    void drawTargetZone();
+    /// Draw-target picker for Controls → Paper (combo only).
+    void drawTargetZonePicker();
     void drawZones();
     void drawZoneInspector(entt::entity zoneEntity = entt::null);
 
@@ -69,6 +72,8 @@ private:
     std::function<void()>               m_onDrawTargetChanged;
     std::function<void(entt::entity)>   m_onSelect;
     std::function<entt::entity()>       m_getSelected;
+
+    std::string m_imguiWindowTitle;
 };
 
 } // namespace plotter::kit

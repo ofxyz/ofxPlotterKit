@@ -1,7 +1,10 @@
 #include "PlotterPrintPreviewPanel.h"
+#include "ImFonts.h"
+#include "IconsFontAwesome5.h"
+#include "PlotterPreviewGrids.h"
 #include "imgui.h"
-
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 
 namespace plotter::kit {
@@ -17,6 +20,7 @@ bool PlotterPrintPreviewPanel::loadFromFile(const std::string& path,
     m_playback  = 1.f;
     m_isPlaying = false;
     parseTravelPaths();
+    m_view.fitToCanvas();
     return true;
 }
 
@@ -29,6 +33,7 @@ bool PlotterPrintPreviewPanel::loadFromText(const std::string& text,
     m_playback  = 1.f;
     m_isPlaying = false;
     parseTravelPaths();
+    m_view.fitToCanvas();
     return true;
 }
 
@@ -117,10 +122,21 @@ void PlotterPrintPreviewPanel::fitView()
 
 void PlotterPrintPreviewPanel::draw(bool& visible)
 {
+    const char* title = m_imguiWindowTitle.empty() ? name().c_str() : m_imguiWindowTitle.c_str();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-    const bool open = ImGui::Begin(name().c_str(), &visible);
+    const bool open = ImGui::Begin(title, &visible, ImGuiWindowFlags_MenuBar);
     ImGui::PopStyleVar();
     if (!open) { ImGui::End(); return; }
+
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Fit"))
+                m_view.fitToCanvas();
+            ImGui::MenuItem("Show Travel Path", nullptr, &showTravelPaths);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
 
     // Compact toolbar row
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 3.f));
@@ -136,21 +152,16 @@ void PlotterPrintPreviewPanel::draw(bool& visible)
     ImGui::PopStyleVar(2);
     ImGui::Separator();
 
-    // FBO preview canvas.
-    // Input pattern mirrors ofxKit Runtime_tools drawViewportWindow2D:
-    // InvisibleButton hit region, hover-gated pan/zoom, wheel consumed.
+    // FBO preview canvas → ImGui vector canvas (crisp at any zoom; grids as overlay).
     const ImVec2 pos   = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const int w = std::max(1, (int)avail.x);
     const int h = std::max(1, (int)avail.y);
 
-    // View2DState works in canvas-local pixels: canvasOrigin stays {0,0} and
-    // pivot coords are passed relative to the canvas top-left, so the derived
-    // ox/oy map directly into the FBO.
-    m_view.contentSize = glm::vec2(m_lastOpts.bounds.size());
-    m_view.canvasW     = (float)w;
-    m_view.canvasH     = (float)h;
-    m_view.updateDerived();
+    m_view.contentSize  = glm::vec2(m_lastOpts.bounds.size());
+    m_view.canvasOrigin = {pos.x, pos.y};
+    m_view.canvasW      = (float)w;
+    m_view.canvasH      = (float)h;
 
     ImGui::InvisibleButton("##pp_canvas", ImVec2((float)w, (float)h));
     const bool hovered = ImGui::IsItemHovered();
@@ -158,10 +169,7 @@ void PlotterPrintPreviewPanel::draw(bool& visible)
 
     ImGuiIO& io = ImGui::GetIO();
     if (hovered && io.MouseWheel != 0.f) {
-        m_view.applyScrollZoom(io.MouseWheel,
-                               io.MousePos.x - pos.x,
-                               io.MousePos.y - pos.y);
-        // Wheel zoom owns the canvas — don't scroll the window or parent dock.
+        m_view.applyScrollZoom(io.MouseWheel, io.MousePos.x, io.MousePos.y);
         io.MouseWheel  = 0.f;
         io.MouseWheelH = 0.f;
     }
@@ -172,13 +180,17 @@ void PlotterPrintPreviewPanel::draw(bool& visible)
         m_view.applyPanDelta(io.MouseDelta.x, io.MouseDelta.y);
 
     m_view.updateDerived();
-    renderToFbo(w, h);
 
-    const ImTextureID texId = (ImTextureID)(uintptr_t)
-        m_fbo.getTexture().getTextureData().textureID;
-    ImGui::GetWindowDrawList()->AddImage(
-        texId, pos, ImVec2(pos.x + (float)w, pos.y + (float)h),
-        ImVec2(0.f, 1.f), ImVec2(1.f, 0.f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 canvasMax(pos.x + (float)w, pos.y + (float)h);
+    dl->PushClipRect(pos, canvasMax, true);
+    dl->AddRectFilled(pos, canvasMax, IM_COL32(18, 18, 24, 255));
+
+    const float ox   = m_view.ox;
+    const float oy   = m_view.oy;
+    const float zoom = m_view.zoom_;
+    drawCanvasImGui(dl, ox, oy, zoom, pos, canvasMax);
+    dl->PopClipRect();
 
     ImGui::End();
 }
@@ -210,6 +222,93 @@ bool PlotterPrintPreviewPanel::drawHeader()
         ImGui::SetTooltip("Path %d / %d", maxPathIndex(), n);
 
     return false;
+}
+
+// ── ImGui vector canvas ───────────────────────────────────────────────────────
+
+void PlotterPrintPreviewPanel::drawCanvasImGui(ImDrawList* dl,
+                                               float ox, float oy, float zoom,
+                                               const ImVec2& clipMin,
+                                               const ImVec2& clipMax)
+{
+    if (!dl || zoom <= 0.f) return;
+
+    const BedView&       bed = m_lastOpts.bed;
+    const PreviewBounds& pb  = m_lastOpts.bounds;
+
+    const float envOrigX = bed.envelope.minX - pb.minX;
+    const float envOrigY = bed.envelope.minY - pb.minY;
+    const glm::vec2 paperOrg = pb.machineToContent(bed.bed.paperOriginX,
+                                                   bed.bed.paperOriginY);
+
+    ofColor envOutline = ofColor(envelopeColor);
+    envOutline.r = (unsigned char)std::min(255, envOutline.r + 60);
+    envOutline.g = (unsigned char)std::min(255, envOutline.g + 60);
+    envOutline.b = (unsigned char)std::min(255, envOutline.b + 60);
+
+    plotter::drawPrintPreviewBedImGui(dl, ox, oy, zoom,
+                                      envOrigX, envOrigY,
+                                      bed.envelope.spanX(), bed.envelope.spanY(),
+                                      paperOrg.x, paperOrg.y,
+                                      paperW, paperH,
+                                      envelopeColor, ofColor(paperColor),
+                                      envOutline);
+
+    if (m_registry) {
+        plotter::drawZoneGrids(dl, *m_registry, pb,
+                               ox, oy, zoom,
+                               clipMin.x, clipMin.y,
+                               clipMax.x - clipMin.x,
+                               clipMax.y - clipMin.y,
+                               m_yAxisUp, m_gridStyle);
+    }
+
+    if (m_preview.hasGeometry()) {
+        const int n       = (int)m_preview.paths().size();
+        const int maxPath = std::clamp((int)(m_playback * n), 0, n);
+        const float thicknessPx = scaleStrokeToPenWidth
+            ? std::max(1.f, penStrokeWidthMm * zoom)
+            : 1.5f;
+        if (overrideColors) {
+            const ofColor              col(drawColor);
+            const std::vector<ofColor> cols(n, col);
+            plotter::drawPrintPreviewPathsImGui(dl, ox, oy, zoom,
+                                                m_preview.paths(), cols, maxPath,
+                                                thicknessPx);
+        } else {
+            plotter::drawPrintPreviewPathsImGui(dl, ox, oy, zoom,
+                                                m_preview.paths(),
+                                                m_preview.pathColors(), maxPath,
+                                                thicknessPx);
+        }
+    }
+
+    // Travel (G0) on top so detours to maintenance zones stay visible over artwork.
+    if (showTravelPaths && !m_travelPaths.empty()) {
+        const ofColor col = ofColor(travelColor);
+        const std::vector<ofColor> cols(m_travelPaths.size(), col);
+        plotter::drawPrintPreviewPathsImGui(dl, ox, oy, zoom,
+                                            m_travelPaths, cols, -1, 1.5f);
+    }
+
+    // Detour targets — zone positions (or zone centre when none are defined).
+    if (m_registry && showTravelPaths) {
+        for (auto e : plotter::collectZoneEntities(*m_registry)) {
+            if (!m_registry->all_of<plotter::machine_zone_component>(e)) continue;
+            const auto& z = m_registry->get<plotter::machine_zone_component>(e);
+            auto mark = [&](float mx, float my) {
+                const glm::vec2 c = pb.machineToContent(mx, my);
+                const ImVec2 sp { ox + c.x * zoom, oy + c.y * zoom };
+                dl->AddCircleFilled(sp, 4.f, IM_COL32(255, 200, 60, 255));
+                dl->AddCircle(sp, 4.f, IM_COL32(40, 40, 40, 210), 0, 1.2f);
+            };
+            if (z.positions.empty())
+                mark(z.x + z.w * 0.5f, z.y + z.h * 0.5f);
+            else
+                for (const auto& p : z.positions)
+                    mark(p.x, p.y);
+        }
+    }
 }
 
 // ── Pure OF scene drawing ─────────────────────────────────────────────────────
@@ -245,18 +344,6 @@ void PlotterPrintPreviewPanel::drawScene(float pxPerMm)
         ofPopStyle();
     }
 
-    // G0 travel paths (under pen-down strokes)
-    if (showTravelPaths && !m_travelPaths.empty()) {
-        const ofColor col = ofColor(travelColor);
-        ofPushStyle();
-        ofNoFill();
-        ofSetColor(col.r, col.g, col.b, col.a);
-        ofSetLineWidth(1.f);
-        for (const auto& p : m_travelPaths)
-            if (p.size() >= 2) p.draw();
-        ofPopStyle();
-    }
-
     // G1/G2/G3 pen-down paths
     if (m_preview.hasGeometry()) {
         const int n       = (int)m_preview.paths().size();
@@ -269,34 +356,18 @@ void PlotterPrintPreviewPanel::drawScene(float pxPerMm)
             m_preview.draw(pxPerMm, maxPath);
         }
     }
-}
 
-// ── FBO render ────────────────────────────────────────────────────────────────
-
-void PlotterPrintPreviewPanel::renderToFbo(int w, int h)
-{
-    if (!m_fbo.isAllocated()
-        || (int)m_fbo.getWidth()  != w
-        || (int)m_fbo.getHeight() != h) {
-        ofFboSettings s;
-        s.width          = w;
-        s.height         = h;
-        s.internalformat = GL_RGBA;
-        s.useDepth       = false;
-        m_fbo.allocate(s);
+    // G0 travel paths on top
+    if (showTravelPaths && !m_travelPaths.empty()) {
+        const ofColor col = ofColor(travelColor);
+        ofPushStyle();
+        ofNoFill();
+        ofSetColor(col.r, col.g, col.b, col.a);
+        ofSetLineWidth(1.5f);
+        for (const auto& p : m_travelPaths)
+            if (p.size() >= 2) p.draw();
+        ofPopStyle();
     }
-
-    m_fbo.begin();
-    {
-        const ofColor base = ofColor(envelopeColor);
-        ofClear(base.r / 2, base.g / 2, base.b / 2, 255);
-    }
-    ofPushMatrix();
-    ofTranslate(m_view.ox, m_view.oy);
-    ofScale(m_view.zoom_);
-    drawScene(m_view.zoom_);
-    ofPopMatrix();
-    m_fbo.end();
 }
 
 // ── Compact transport controls ────────────────────────────────────────────────
@@ -310,24 +381,35 @@ void PlotterPrintPreviewPanel::drawTransportControls()
 
     const int n = (int)m_preview.paths().size();
 
-    if (ImGui::Button("|<##pp0")) { m_playback = 0.f; m_isPlaying = false; }
+    if (ImFonts::IconButton(ICON_FA_FAST_BACKWARD, "##pp0")) {
+        m_playback = 0.f;
+        m_isPlaying = false;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start");
     ImGui::SameLine();
-    if (ImGui::Button("< ##pp1")) stepPath(-1);
+    if (ImFonts::IconButton(ICON_FA_STEP_BACKWARD, "##pp1")) stepPath(-1);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous path");
     ImGui::SameLine();
     if (m_isPlaying) {
-        if (ImGui::Button("||##pp2")) m_isPlaying = false;
+        if (ImFonts::IconButton(ICON_FA_PAUSE, "##pp2")) m_isPlaying = false;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pause");
     } else {
-        if (ImGui::Button("> ##pp2")) {
+        if (ImFonts::IconButton(ICON_FA_PLAY, "##pp2")) {
             if (m_playback >= 1.f) m_playback = 0.f;
             m_isPlaying = true;
         }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play");
     }
     ImGui::SameLine();
-    if (ImGui::Button(" >##pp3")) stepPath(+1);
+    if (ImFonts::IconButton(ICON_FA_STEP_FORWARD, "##pp3")) stepPath(+1);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next path");
     ImGui::SameLine();
-    if (ImGui::Button(">|##pp4")) { m_playback = 1.f; m_isPlaying = false; }
+    if (ImFonts::IconButton(ICON_FA_FAST_FORWARD, "##pp4")) {
+        m_playback = 1.f;
+        m_isPlaying = false;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("End");
     ImGui::SameLine();
-
     float pct = m_playback * 100.f;
     ImGui::SetNextItemWidth(-140.f);
     if (ImGui::SliderFloat("##ppScrub", &pct, 0.f, 100.f, "%.1f%%"))
@@ -337,68 +419,19 @@ void PlotterPrintPreviewPanel::drawTransportControls()
     ImGui::SameLine();
     ImGui::SetNextItemWidth(70.f);
     ImGui::SliderFloat("##ppSpd", &playbackSpeed, 1.f, 200.f, "%.0fps");
+    ImGui::TextDisabled("Scroll zoom · Mid/Alt-drag pan · Dbl-click fit");
 }
 
 // ── Travel path parser ────────────────────────────────────────────────────────
 
 void PlotterPrintPreviewPanel::parseTravelPaths()
 {
-    m_travelPaths.clear();
-    const std::string& gcode = m_preview.sourceText();
-    if (gcode.empty()) return;
-
-    const PreviewBounds& pb = m_lastOpts.bounds;
-
-    auto parseF = [](const std::string& tok, size_t start) -> float {
-        try { return std::stof(tok.substr(start)); } catch (...) { return 0.f; }
-    };
-
-    ofPolyline seg;
-    float x = 0.f, y = 0.f;
-    bool  modalG0 = false;
-
-    std::istringstream iss(gcode);
-    std::string line;
-    while (std::getline(iss, line)) {
-        const auto ci = line.find(';');
-        if (ci != std::string::npos) line.resize(ci);
-
-        bool  isG0 = false, isG1orArc = false;
-        float nx = x, ny = y;
-        bool  moved = false;
-
-        std::istringstream ls(line);
-        std::string tok;
-        while (ls >> tok) {
-            if (tok.empty()) continue;
-            const char c0 = (char)toupper((unsigned char)tok[0]);
-            if (c0 == 'G') {
-                int n2 = 0;
-                try { n2 = std::stoi(tok.substr(1)); } catch (...) {}
-                if (n2 == 0)                           isG0      = true;
-                else if (n2 == 1 || n2 == 2 || n2 == 3) isG1orArc = true;
-            } else if (c0 == 'X') { nx = parseF(tok, 1); moved = true; }
-              else if (c0 == 'Y') { ny = parseF(tok, 1); moved = true; }
-        }
-
-        const bool wasG0 = modalG0;
-        if (isG0)      modalG0 = true;
-        if (isG1orArc) modalG0 = false;
-        const bool nowG0 = modalG0;
-
-        if (!moved) continue;
-        if (wasG0 != nowG0) {
-            if (seg.size() >= 2) m_travelPaths.push_back(seg);
-            seg.clear();
-        }
-        x = nx; y = ny;
-        if (nowG0) {
-            const glm::vec2 c = pb.machineToContent(x, y);
-            seg.addVertex(c.x, c.y, 0.f);
-        }
-    }
-    if (seg.size() >= 2 && modalG0)
-        m_travelPaths.push_back(seg);
+    // Vertices keep MACHINE Z in .z (airborne feed moves included) so the 3D
+    // toolpath view can show the true smooth-lead geometry; the 2D draw path
+    // simply ignores the Z component.
+    m_travelPaths = PlotterPrintPreview::parseTravelPathsFromGcode(
+        m_preview.sourceText(), m_lastOpts.bounds,
+        m_lastOpts.import.penDownMaxZ);
 }
 
 } // namespace plotter::kit

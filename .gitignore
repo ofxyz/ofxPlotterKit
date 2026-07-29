@@ -1,0 +1,153 @@
+#########################
+# general patterns
+#########################
+
+docs/html
+docs/tagfile.xml
+
+*/bin/*
+!*/bin/data/
+
+# for bin folder in root
+/bin/*
+!/bin/data/
+
+#########################
+# example runtime / local state (do not commit)
+#########################
+
+# IDE / local debug helpers
+.clangd
+**/.clangd
+.dbg_syntax.sh
+**/.dbg_*.sh
+
+# ImGui / session / dialogs
+**/bin/data/**/imgui.ini
+**/bin/data/**/imgui.*.ini
+**/bin/data/**/imgui_*.ini
+**/bin/data/**/appPrefs.json
+**/bin/data/**/documentPrefs.json
+**/bin/data/**/fileDialog*.txt
+**/bin/data/**/uiScale.json
+**/bin/data/**/.plotter_*_layout_version
+**/bin/data/**/plotter_effects.json
+
+# Machine- and user-specific settings (builtins live in code)
+**/bin/data/**/MachinePrefs.json
+**/bin/data/**/PenPresets.json
+**/bin/data/**/PlotterZones.json
+
+# Ephemeral inject snippets (keep named templates like pen_pump.gcode)
+**/bin/data/**/snippets/inject_*.gcode
+
+# Generated output / personal presets
+**/bin/data/generated/
+**/bin/data/**/Generated.gcode
+**/bin/data/pen_presets/*
+!**/bin/data/pen_presets/EVA3.json
+
+[Bb]uild/
+[Oo]bj/
+*.o
+[Dd]ebug*/
+[Rr]elease*/
+*.mode*
+*.app/
+*.pyc
+.svn/
+
+#########################
+# IDE
+#########################
+
+# XCode
+*.pbxuser
+*.perspective
+*.perspectivev3
+*.mode1v3
+*.mode2v3
+#XCode 4
+xcuserdata
+*.xcworkspace
+
+# Code::Blocks
+*.depend
+*.layout
+*.cbTemp
+
+# Visual Studio
+*.sdf
+*.opensdf
+*.suo
+*.pdb
+*.ilk
+*.aps
+ipch/
+.vs
+*.sln
+*.vcxproj
+*.vcxproj.*
+
+# Eclipse
+.metadata
+local.properties
+.externalToolBuilders
+
+# Codelite
+*.session
+*.tags
+*.workspace.*
+
+#########################
+# operating system
+#########################
+
+# Linux
+*~
+# KDE
+.directory
+.AppleDouble
+
+# OSX
+.DS_Store
+*.swp
+*~.nib
+# Thumbnails
+._*
+
+# Windows
+# Windows image file caches
+Thumbs.db
+# Folder config file
+Desktop.ini
+
+#Android
+.csettings
+
+#########################
+# packages
+#########################
+
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+#########################
+# DLL
+#########################
+*.dll
+example*/icon.rc
+example*/addons.make

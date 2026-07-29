@@ -1,0 +1,31 @@
+{
+    "presets": [
+        {
+            "data": {
+                "maxX": 1300.0,
+                "maxY": 1300.0,
+                "minX": 0.0,
+                "minY": 0.0
+            },
+            "label": "OXMAN-CNC"
+        },
+        {
+            "data": {
+                "maxX": 1000.0,
+                "maxY": 1000.0,
+                "minX": 0.0,
+                "minY": 0.0
+            },
+            "label": "1000OX"
+        },
+        {
+            "data": {
+                "maxX": 1210.0,
+                "maxY": 1210.0,
+                "minX": 0.0,
+                "minY": 0.0
+            },
+            "label": "OX_WOOD"
+        }
+    ]
+}

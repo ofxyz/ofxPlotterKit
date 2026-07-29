@@ -1,0 +1,13 @@
+{
+    "presets": [
+        {
+            "data": {
+                "paperH": 1117.0,
+                "paperOriginX": 0.0,
+                "paperOriginY": 0.0,
+                "paperW": 1117.0
+            },
+            "label": "Nim_Canvas"
+        }
+    ]
+}

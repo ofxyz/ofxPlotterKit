@@ -41,16 +41,15 @@ void PlotterZonesPanel::syncSelectedFromCallback()
 
 void PlotterZonesPanel::draw(bool& visible)
 {
-    if (!ImGui::Begin(name().c_str(), &visible)) { ImGui::End(); return; }
-    drawTargetZone();
-    ImGui::Separator();
+    const char* title = m_imguiWindowTitle.empty() ? name().c_str() : m_imguiWindowTitle.c_str();
+    if (!ImGui::Begin(title, &visible)) { ImGui::End(); return; }
     drawZones();
     ImGui::End();
 }
 
 // ── embeddable sections ───────────────────────────────────────────────────────
 
-void PlotterZonesPanel::drawTargetZone()
+void PlotterZonesPanel::drawTargetZonePicker()
 {
     if (!m_registry || !m_zones) {
         ImGui::TextDisabled("No zone store attached.");
@@ -65,7 +64,7 @@ void PlotterZonesPanel::drawTargetZone()
     names.reserve(zoneEnts.size() + 1);
     int cur = 0;
     for (int i = 0; i < (int)zoneEnts.size(); ++i) {
-        const auto& mc = m_registry->get<machine_zone_component>(zoneEnts[i]);
+        const auto& mc = m_registry->get<machine_zone_component>(zoneEnts[(size_t)i]);
         nameStrs.push_back(mc.name);
         names.push_back(nameStrs.back().c_str());
         if (mc.zoneId == m_zones->drawTargetZoneId) cur = i;
@@ -74,33 +73,24 @@ void PlotterZonesPanel::drawTargetZone()
     nameStrs.emplace_back("New Zone...");
     names.push_back(nameStrs.back().c_str());
 
-    if (ImGui::CollapsingHeader("Target Zone", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Combo("Target zone", &cur, names.data(), (int)names.size())) {
-            if (cur == newIdx) {
-                const entt::entity e = createZone();
-                if (e != entt::null) {
-                    m_zones->drawTargetZoneId =
-                        m_registry->get<machine_zone_component>(e).zoneId;
-                    if (m_onDrawTargetChanged) m_onDrawTargetChanged();
-                }
-            } else if (cur >= 0 && cur < (int)zoneEnts.size()) {
+    ImGui::SetNextItemWidth(-1.f);
+    if (ImGui::Combo("Target zone", &cur, names.data(), (int)names.size())) {
+        if (cur == newIdx) {
+            const entt::entity e = createZone();
+            if (e != entt::null) {
                 m_zones->drawTargetZoneId =
-                    m_registry->get<machine_zone_component>(zoneEnts[cur]).zoneId;
-                m_selectedZone = zoneEnts[cur];
-                if (m_onSelect) m_onSelect(m_selectedZone);
+                    m_registry->get<machine_zone_component>(e).zoneId;
                 if (m_onDrawTargetChanged) m_onDrawTargetChanged();
             }
-        }
-
-        const entt::entity target = findZoneEntity(*m_registry, m_zones->drawTargetZoneId);
-        if (target != entt::null) {
-            ImGui::PushID(m_registry->get<machine_zone_component>(target).zoneId.c_str());
-            drawZoneInspector(target);
-            ImGui::PopID();
-        } else {
-            ImGui::TextDisabled("Choose a target zone or create one with New Zone...");
+        } else if (cur >= 0 && cur < (int)zoneEnts.size()) {
+            m_zones->drawTargetZoneId =
+                m_registry->get<machine_zone_component>(zoneEnts[(size_t)cur]).zoneId;
+            m_selectedZone = zoneEnts[(size_t)cur];
+            if (m_onSelect) m_onSelect(m_selectedZone);
+            if (m_onDrawTargetChanged) m_onDrawTargetChanged();
         }
     }
+    ImGui::TextDisabled("Drawing canvas — size and origin sync below.");
 }
 
 void PlotterZonesPanel::drawZones()
@@ -200,6 +190,32 @@ void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
     }
     ImGui::TextDisabled("Machine coordinates (mm)");
 
+    if (ImGui::Button("Rotate 90\xc2\xb0##zone")) {
+        const float cx = z.x + z.w * 0.5f;
+        const float cy = z.y + z.h * 0.5f;
+        // Rotate positions about the centre, CCW: (dx,dy) -> (-dy,dx).
+        for (auto& p : z.positions) {
+            const float dx = p.x - cx;
+            const float dy = p.y - cy;
+            p.x = cx - dy;
+            p.y = cy + dx;
+        }
+        std::swap(z.w, z.h);
+        z.x = cx - z.w * 0.5f;
+        z.y = cy - z.h * 0.5f;
+        // Margins follow the content: left->bottom, bottom->right, right->top, top->left.
+        const float l = z.margins.left, r = z.margins.right;
+        const float t = z.margins.top,  b = z.margins.bottom;
+        z.margins.bottom = l;
+        z.margins.right  = b;
+        z.margins.top    = r;
+        z.margins.left   = t;
+        if (isTarget && m_onDrawTargetChanged) m_onDrawTargetChanged();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Swap width/height about the zone centre (CCW).\n"
+                          "Positions and margins rotate with it.");
+
     if (ImGui::DragFloat4("Margin L/R/T/B mm##zone", &z.margins.left,
                           0.25f, 0.f, 200.f, "%.1f")) {
         if (isTarget && m_onDrawTargetChanged) m_onDrawTargetChanged();
@@ -223,6 +239,31 @@ void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
         ImGui::SameLine();
         if (ImGui::Button("Max X edge"))
             snap([&]{ z.x = env.maxX - z.w; });
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Positions (%d)", (int)z.positions.size());
+    if (ImGui::Button("Add default position##zone")) {
+        ZonePosition p;
+        p.x = z.x + z.w * 0.5f;
+        p.y = z.y + z.h * 0.5f;
+        p.positionIndex = (int)z.positions.size();
+        p.label = "pos" + std::to_string(p.positionIndex);
+        z.positions.push_back(std::move(p));
+    }
+    for (int pi = 0; pi < (int)z.positions.size(); ++pi) {
+        ImGui::PushID(pi);
+        auto& p = z.positions[(size_t)pi];
+        ImGui::DragFloat2("XY##pos", &p.x, 0.5f);
+        ImGui::InputInt("Index##pos", &p.positionIndex);
+        char lbl[64];
+        std::strncpy(lbl, p.label.c_str(), sizeof(lbl) - 1);
+        lbl[sizeof(lbl) - 1] = '\0';
+        if (ImGui::InputText("Label##pos", lbl, sizeof(lbl)))
+            p.label = lbl;
+        if (ImGui::Button("Remove##pos"))
+            z.positions.erase(z.positions.begin() + pi);
+        ImGui::PopID();
     }
 
     ImGui::Separator();
