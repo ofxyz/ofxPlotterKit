@@ -4,6 +4,7 @@
 #include "windows/PlotterZonesPanel.h"
 #include "windows/PlotterPipelinePanel.h"
 #include "windows/PlotterInjectionsPanel.h"
+#include "windows/PlotterEnvelopePanel.h"
 #include "windows/PlotterPlaybackPanel.h"
 #include "windows/PlotterJogWindow.h"
 #include "windows/PlotterSerialWindow.h"

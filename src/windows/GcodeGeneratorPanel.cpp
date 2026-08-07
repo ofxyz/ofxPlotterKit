@@ -3,6 +3,7 @@
 #include "PlottableDefaults.h"
 #include "PenSettingsPresets.h"
 #include "PlotterBedCoords.h"
+#include "PlotterCropmarks.h"
 #include "kit/PlotterGeneratorLayerNames.h"
 #include "windows/PlotterFeedRateUi.h"
 #include "PlotterFilterStepUi.h"
@@ -1199,7 +1200,9 @@ void GcodeGeneratorPanel::drawCropmarksGeneratorBody()
     ImGui::SetNextItemWidth(80.f);
     ImGui::DragFloat("Mark length", &m_cropmarksLength, 0.5f, 1.f, 100.f, "%.1f mm");
     ImGui::SetNextItemWidth(80.f);
-    ImGui::DragFloat("Inset from margin", &m_cropmarksInset, 0.5f, 0.f, 100.f, "%.1f mm");
+    ImGui::DragFloat("Inset from margin", &m_cropmarksInset, 0.5f, -100.f, 100.f, "%.1f mm");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("+ inward from margin box  ·  − outward");
 
     ImGui::SetNextItemWidth(generatorMarginDragWidth());
     ImGui::DragFloat4("Margin L/R/T/B", &m_cropmarksMargins.left, 0.5f, 0.f, 9999.f, "%.1f");
@@ -1497,30 +1500,35 @@ void GcodeGeneratorPanel::generateBorder()
 
 void GcodeGeneratorPanel::generateCropmarks()
 {
-    if (!m_engine) return;
+    if (!m_engine || !m_zones) return;
 
-    DrawTargetInnerRect area;
-    if (!queryDrawTargetInnerRect(m_zones, m_cropmarksMargins, area)) return;
-
-    const entt::entity layerEnt = prepareGeneratorLayer(generatorLayerEnt(kCropmarksId), generatorLayerName(kCropmarksId));
     auto& reg = m_engine->getRegistry();
-    auto& pc  = reg.get_or_emplace<plotter::paths_component>(layerEnt);
+    const entt::entity zoneEnt = m_zones->findDrawTargetZone(reg);
+    if (zoneEnt == entt::null || !reg.all_of<plotter::machine_zone_component>(zoneEnt))
+        return;
 
-    plotgen::GeneratorPathContext ctx;
-    ctx.paths = &pc;
-    ctx.x0 = area.x0;
-    ctx.y0 = area.y0;
-    ctx.x1 = area.x1;
-    ctx.y1 = area.y1;
+    const char* layerName = generatorLayerName(kCropmarksId);
+    const entt::entity prepared =
+        prepareGeneratorLayer(generatorLayerEnt(kCropmarksId), layerName);
 
-    const ofJson settings = {
-        {"length", m_cropmarksLength},
-        {"inset", m_cropmarksInset},
-    };
-    plotgen::GeneratorRegistry::instance().generatePaths({"path", "cropmarks"}, ctx, settings);
-    if (pc.paths.empty())
-        ofLogWarning("GcodeGeneratorPanel") << "Cropmarks generator produced no drawable paths.";
-    pinLayerFirst(layerEnt);
+    CropmarksGenerateOpts opts;
+    opts.lengthMm     = m_cropmarksLength;
+    opts.insetMm      = m_cropmarksInset;
+    opts.margins      = m_cropmarksMargins;
+    opts.thicknessMm  = std::max(0.05f, m_engine->pen.penWidth);
+    opts.color        = ofColor(0, 0, 0, 255);
+    opts.targetLayer  = prepared;
+    opts.newLayerName = layerName ? layerName : "Cropmarks";
+    opts.pinFirst     = true;
+
+    std::string err;
+    const entt::entity layerEnt =
+        generateCropmarksForZone(*m_engine, *m_zones, m_prefs, zoneEnt, opts, &err);
+    if (layerEnt == entt::null) {
+        ofLogWarning("GcodeGeneratorPanel")
+            << (err.empty() ? "Cropmarks generate failed." : err);
+        return;
+    }
     notifyGeneratorPathsChanged();
 }
 

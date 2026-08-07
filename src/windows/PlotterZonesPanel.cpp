@@ -1,4 +1,6 @@
 #include "PlotterZonesPanel.h"
+#include "PlotterCropmarks.h"
+#include "PlotterGCodeInjector.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -43,7 +45,9 @@ void PlotterZonesPanel::draw(bool& visible)
 {
     const char* title = m_imguiWindowTitle.empty() ? name().c_str() : m_imguiWindowTitle.c_str();
     if (!ImGui::Begin(title, &visible)) { ImGui::End(); return; }
-    drawZones();
+    drawTargetZonePicker();
+    ImGui::Spacing();
+    drawZones(); // includes drawCropmarksModal()
     ImGui::End();
 }
 
@@ -90,7 +94,7 @@ void PlotterZonesPanel::drawTargetZonePicker()
             if (m_onDrawTargetChanged) m_onDrawTargetChanged();
         }
     }
-    ImGui::TextDisabled("Drawing canvas — size and origin sync below.");
+    ImGui::TextDisabled("Drawing canvas — edit size/origin on the target zone below.");
 }
 
 void PlotterZonesPanel::drawZones()
@@ -122,6 +126,9 @@ void PlotterZonesPanel::drawZones()
         ImGui::PopID();
         ++idx;
     }
+
+    // Modal must be submitted in the same ImGui window as OpenPopup (draw or embed).
+    drawCropmarksModal();
 }
 
 void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
@@ -149,6 +156,17 @@ void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
     ImGui::InputText("Name##zone", s_nameBuf, sizeof(s_nameBuf));
     if (ImGui::IsItemDeactivatedAfterEdit())
         z.name = s_nameBuf;
+
+    if (isTarget) {
+        ImGui::TextDisabled("Draw target (paper / canvas)");
+    } else {
+        if (ImGui::Button("Use as draw target##zone")) {
+            m_zones->drawTargetZoneId = z.zoneId;
+            if (m_onDrawTargetChanged) m_onDrawTargetChanged();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Paper size and origin for drawing / export.");
+    }
 
     ImGui::ColorEdit4("Colour##zone", z.color, ImGuiColorEditFlags_AlphaBar);
     ImGui::Checkbox("Show grid##zone",    &z.showGrid);
@@ -267,6 +285,55 @@ void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
     }
 
     ImGui::Separator();
+    ImGui::TextUnformatted("3D model (Toolpath 3D)");
+    ImGui::TextDisabled("Paint bucket, canvas stretcher, etc. — bed preview props.");
+    {
+        char pathBuf[512];
+        std::strncpy(pathBuf, z.modelPath.c_str(), sizeof(pathBuf) - 1);
+        pathBuf[sizeof(pathBuf) - 1] = '\0';
+        ImGui::SetNextItemWidth(-1.f);
+        if (ImGui::InputText("##zoneModelPath", pathBuf, sizeof(pathBuf)))
+            z.modelPath = pathBuf;
+        if (ImGui::Button("Browse model\xe2\x80\xa6##zoneModel")) {
+            ofFileDialogResult r = ofSystemLoadDialog(
+                "3D model (obj/gltf/glb/fbx/stl/ply)", false,
+                ofToDataPath("models", true));
+            if (r.bSuccess)
+                z.modelPath = normalizeDataPath(r.getPath());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##zoneModel"))
+            z.modelPath.clear();
+        ImGui::Checkbox("Show in Toolpath 3D##zoneModel", &z.modelVisible);
+        ImGui::Checkbox("Fit footprint to zone##zoneModel", &z.modelFitToZone);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Scale the model so its XY size fits this zone's W×H,\n"
+                              "then apply Scale below.");
+        ImGui::DragFloat("Scale##zoneModel", &z.modelScale, 0.01f, 0.01f, 100.f, "%.3f");
+        ImGui::DragFloat3("Offset XYZ mm##zoneModel", &z.modelOffsetX, 0.5f, -2000.f, 2000.f, "%.1f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("From zone centre. Z = height above the bed (real mm,\n"
+                              "not affected by Toolpath 3D Z exaggeration).");
+        ImGui::DragFloat3("Rotate XYZ deg##zoneModel", &z.modelRotX, 1.f, -360.f, 360.f, "%.0f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Default Rot X = −90 maps common Z-up models into\n"
+                              "the Y-up Toolpath 3D scene.");
+    }
+
+    ImGui::Separator();
+
+    if (m_plotDoc) {
+        if (ImGui::Button("Generate Cropmarks\xe2\x80\xa6##zone"))
+            openCropmarksModal(entity);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "L-corner ticks on this zone's margin box for alignment.\n"
+                "Writes a PlotDoc layer (new or replace existing).");
+    } else {
+        ImGui::TextDisabled("Cropmarks — attach PlotDoc to enable");
+    }
+
+    ImGui::Separator();
 
     // Delete button
     if (ImGui::Button("Delete zone##zone")) {
@@ -281,6 +348,148 @@ void PlotterZonesPanel::drawZoneInspector(entt::entity zoneEntity)
             if (m_onDrawTargetChanged) m_onDrawTargetChanged();
         }
     }
+}
+
+void PlotterZonesPanel::openCropmarksModal(entt::entity zoneEntity)
+{
+    if (!m_registry || !m_plotDoc || zoneEntity == entt::null
+        || !m_registry->valid(zoneEntity)
+        || !m_registry->all_of<machine_zone_component>(zoneEntity))
+        return;
+
+    const auto& z = m_registry->get<machine_zone_component>(zoneEntity);
+    m_cropmarksZone      = zoneEntity;
+    m_cmLength           = 10.f;
+    m_cmInset            = 5.f;
+    m_cmThickness        = std::max(0.05f, m_defaultPenWidthMm);
+    m_cmColor[0]         = z.color[0];
+    m_cmColor[1]         = z.color[1];
+    m_cmColor[2]         = z.color[2];
+    m_cmColor[3]         = z.color[3] > 0.01f ? z.color[3] : 1.f;
+    m_cmUseZoneMargins   = true;
+    m_cmMargins          = z.margins;
+    m_cmLayerCombo       = 0;
+    m_cmStatus.clear();
+    m_cropmarksModalOpen = true;
+    ImGui::OpenPopup("Generate Cropmarks##zoneCropmarks");
+}
+
+void PlotterZonesPanel::drawCropmarksModal()
+{
+    if (m_cropmarksModalOpen)
+        ImGui::OpenPopup("Generate Cropmarks##zoneCropmarks");
+
+    ImGui::SetNextWindowSize(ImVec2(420.f, 0.f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Generate Cropmarks##zoneCropmarks",
+                                &m_cropmarksModalOpen,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    if (!m_registry || !m_zones || !m_plotDoc
+        || m_cropmarksZone == entt::null
+        || !m_registry->valid(m_cropmarksZone)
+        || !m_registry->all_of<machine_zone_component>(m_cropmarksZone)) {
+        ImGui::TextDisabled("Zone no longer available.");
+        if (ImGui::Button("Close")) {
+            m_cropmarksModalOpen = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+        return;
+    }
+
+    const auto& z = m_registry->get<machine_zone_component>(m_cropmarksZone);
+    ImGui::Text("Zone: %s", z.name.empty() ? z.zoneId.c_str() : z.name.c_str());
+    ImGui::TextDisabled(
+        "L-corner ticks on the margin box. Positive inset moves inward;\n"
+        "negative inset moves the marks outside the box.");
+
+    ImGui::SetNextItemWidth(120.f);
+    ImGui::DragFloat("Mark length", &m_cmLength, 0.5f, 1.f, 100.f, "%.1f mm");
+    ImGui::SetNextItemWidth(120.f);
+    ImGui::DragFloat("Inset", &m_cmInset, 0.5f, -100.f, 100.f, "%.1f mm");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("+ inward from margin box  ·  − outward");
+
+    ImGui::SetNextItemWidth(120.f);
+    ImGui::DragFloat("Line thickness", &m_cmThickness, 0.05f, 0.05f, 10.f, "%.2f mm");
+    ImGui::ColorEdit4("Colour", m_cmColor, ImGuiColorEditFlags_AlphaBar);
+
+    ImGui::Checkbox("Use zone margins", &m_cmUseZoneMargins);
+    if (m_cmUseZoneMargins)
+        m_cmMargins = z.margins;
+    else {
+        ImGui::SetNextItemWidth(280.f);
+        ImGui::DragFloat4("Margin L/R/T/B", &m_cmMargins.left, 0.25f, 0.f, 500.f, "%.1f");
+    }
+
+    // Layer combo: New… then existing layers
+    std::vector<entt::entity> layerEnts;
+    std::vector<std::string> layerNames;
+    layerEnts.push_back(entt::null);
+    layerNames.emplace_back("New layer");
+    auto& docReg = m_plotDoc->getRegistry();
+    for (entt::entity le : m_plotDoc->layerOrder) {
+        if (!docReg.valid(le) || !docReg.all_of<ecs::layer_component>(le)) continue;
+        layerEnts.push_back(le);
+        layerNames.push_back(docReg.get<ecs::layer_component>(le).name);
+    }
+    m_cmLayerCombo = std::clamp(m_cmLayerCombo, 0, (int)layerNames.size() - 1);
+
+    std::vector<const char*> layerLabels;
+    layerLabels.reserve(layerNames.size());
+    for (const auto& n : layerNames) layerLabels.push_back(n.c_str());
+
+    ImGui::SetNextItemWidth(280.f);
+    ImGui::Combo("Layer", &m_cmLayerCombo, layerLabels.data(), (int)layerLabels.size());
+    if (m_cmLayerCombo == 0)
+        ImGui::TextDisabled("Creates \"Cropmarks — %s\"",
+                            z.name.empty() ? z.zoneId.c_str() : z.name.c_str());
+    else
+        ImGui::TextDisabled("Replaces paths on the selected layer.");
+
+    if (!m_cmStatus.empty()) {
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", m_cmStatus.c_str());
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Generate", ImVec2(120.f, 0.f))) {
+        CropmarksGenerateOpts opts;
+        opts.lengthMm    = m_cmLength;
+        opts.insetMm     = m_cmInset;
+        opts.margins     = m_cmUseZoneMargins ? z.margins : m_cmMargins;
+        opts.thicknessMm = m_cmThickness;
+        opts.color       = ofColor(m_cmColor[0] * 255.f, m_cmColor[1] * 255.f,
+                                   m_cmColor[2] * 255.f, m_cmColor[3] * 255.f);
+        opts.pinFirst    = true;
+        if (m_cmLayerCombo > 0 && m_cmLayerCombo < (int)layerEnts.size()) {
+            opts.targetLayer  = layerEnts[(size_t)m_cmLayerCombo];
+            opts.newLayerName = layerNames[(size_t)m_cmLayerCombo];
+        } else {
+            opts.targetLayer  = entt::null;
+            opts.newLayerName = "Cropmarks — "
+                + (z.name.empty() ? z.zoneId : z.name);
+        }
+
+        std::string err;
+        const entt::entity layer = generateCropmarksForZone(
+            *m_plotDoc, *m_zones, m_prefs, m_cropmarksZone, opts, &err);
+        if (layer == entt::null) {
+            m_cmStatus = err.empty() ? "Generate failed." : err;
+        } else {
+            if (m_onCropmarksGenerated) m_onCropmarksGenerated(layer);
+            m_cropmarksModalOpen = false;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120.f, 0.f))) {
+        m_cropmarksModalOpen = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
 }
 
 } // namespace plotter::kit

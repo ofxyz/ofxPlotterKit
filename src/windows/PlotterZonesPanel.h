@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PlotDoc.h"
 #include "PlotterZones.h"
 
 #include <MachinePrefs.h>
@@ -33,8 +34,21 @@ public:
     void setRegistry(entt::registry* reg)               { m_registry = reg; }
     void setZoneStore(PlotterZoneStore* zones)           { m_zones = zones; }
 
-    /// Optional: provide machine prefs so zone inspector shows alignment buttons.
+    /// Optional: provide machine prefs so zone inspector shows alignment buttons
+    /// and cropmarks can map zone-local → paper-local correctly.
     void setPrefs(grbl::MachinePrefs* prefs)             { m_prefs = prefs; }
+
+    /// Optional PlotDoc for Generate Cropmarks (writes a paths layer).
+    void setPlotDoc(PlotDoc* doc)                        { m_plotDoc = doc; }
+
+    /// Default stroke thickness (mm) when opening the cropmarks modal.
+    void setDefaultPenWidthMm(float mm)                  { m_defaultPenWidthMm = mm; }
+
+    /// Called after cropmarks are written into a layer (host: dirty + preview).
+    void setOnCropmarksGenerated(std::function<void(entt::entity layer)> cb)
+    {
+        m_onCropmarksGenerated = std::move(cb);
+    }
 
     /// Called when the draw-target zone selection or its geometry changes.
     void setOnDrawTargetChanged(std::function<void()> cb){ m_onDrawTargetChanged = std::move(cb); }
@@ -59,21 +73,41 @@ public:
     void drawZones();
     void drawZoneInspector(entt::entity zoneEntity = entt::null);
 
+    /// Submit the cropmarks popup (call from the same ImGui window that hosts
+    /// the inspector if you embed drawZoneInspector outside drawZones()).
+    void drawCropmarksModal();
+
 private:
     entt::entity createZone();
     void syncSelectedFromCallback();
+    void openCropmarksModal(entt::entity zoneEntity);
 
     entt::registry*   m_registry = nullptr;
     PlotterZoneStore* m_zones    = nullptr;
     grbl::MachinePrefs* m_prefs  = nullptr;
+    PlotDoc*          m_plotDoc  = nullptr;
+    float             m_defaultPenWidthMm = 0.3f;
 
     entt::entity m_selectedZone { entt::null };
 
     std::function<void()>               m_onDrawTargetChanged;
     std::function<void(entt::entity)>   m_onSelect;
     std::function<entt::entity()>       m_getSelected;
+    std::function<void(entt::entity)>   m_onCropmarksGenerated;
 
     std::string m_imguiWindowTitle;
+
+    // Cropmarks modal state
+    bool         m_cropmarksModalOpen = false;
+    entt::entity m_cropmarksZone      { entt::null };
+    float        m_cmLength           = 10.f;
+    float        m_cmInset            = 5.f;
+    float        m_cmThickness        = 0.3f;
+    float        m_cmColor[4]         = { 0.f, 0.f, 0.f, 1.f };
+    bool         m_cmUseZoneMargins   = true;
+    ZoneMarginsMM m_cmMargins;
+    int          m_cmLayerCombo       = 0; ///< 0 = New layer, else index into layer list + 1
+    std::string  m_cmStatus;
 };
 
 } // namespace plotter::kit

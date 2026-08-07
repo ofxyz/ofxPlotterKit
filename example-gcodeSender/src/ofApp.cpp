@@ -23,7 +23,7 @@ namespace {
 
 /// Bump when the shipped dock layout changes — reseeds imgui.ini from
 /// imgui.default.ini once so fresh checkouts and upgrades share the same layout.
-constexpr int kGcodeSenderImGuiLayoutVersion = 2;
+constexpr int kGcodeSenderImGuiLayoutVersion = 3;
 
 bool ensureDefaultImGuiLayout()
 {
@@ -121,15 +121,50 @@ std::string flipZWordsInGcode(const std::string& input)
 }
 
 /// Label-left / widget-right row (same idea as ofxEnTTInspector ComponentInspector).
+/// Uses InputFloat so typed values (including negatives) work without Ctrl+Click.
+/// Unit suffixes in @p fmt (e.g. "%.2f mm") are drawn beside the field — keeping
+/// them inside the format string makes ImGui's temp buffer awkward to edit.
 bool dragFloatLabeled(float labelColW, const char* label, float* v,
                       float speed, float vMin, float vMax, const char* fmt)
 {
+    const char* unit = nullptr;
+    char numFmt[32] = "%.3f";
+    if (fmt && fmt[0]) {
+        const char* start = fmt;
+        while (*start && *start != '%') ++start;
+        if (*start == '%') {
+            const char* end = start + 1;
+            while (*end && ((*end >= '0' && *end <= '9') || *end == '.' || *end == '+'
+                            || *end == '-' || *end == '#' || *end == ' '))
+                ++end;
+            // type char (f/g/e…)
+            if (*end) ++end;
+            const size_t n = (size_t)(end - start);
+            if (n > 0 && n < sizeof(numFmt)) {
+                for (size_t i = 0; i < n; ++i)
+                    numFmt[i] = start[i];
+                numFmt[n] = '\0';
+            }
+            if (*end) unit = end; // leading space in " mm" is fine
+        }
+    }
+
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
     ImGui::SameLine(labelColW);
-    ImGui::SetNextItemWidth(std::max(48.f, ImGui::GetContentRegionAvail().x));
+    const float unitW = unit
+        ? ImGui::CalcTextSize(unit).x + ImGui::GetStyle().ItemInnerSpacing.x
+        : 0.f;
+    ImGui::SetNextItemWidth(std::max(48.f, ImGui::GetContentRegionAvail().x - unitW));
     ImGui::PushID(label);
-    const bool changed = ImGui::DragFloat("##v", v, speed, vMin, vMax, fmt);
+    const float step = (speed > 0.f) ? speed : 0.f;
+    bool changed = ImGui::InputFloat("##v", v, step, step > 0.f ? step * 10.f : 0.f, numFmt);
+    if (changed && vMin < vMax)
+        *v = std::clamp(*v, vMin, vMax);
+    if (unit) {
+        ImGui::SameLine(0.f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::TextUnformatted(unit);
+    }
     ImGui::PopID();
     return changed;
 }
@@ -326,14 +361,14 @@ void ofApp::setup()
     machinePrefs.load();
     paperOriginX = machinePrefs.bed.paperOriginX;
     paperOriginY = machinePrefs.bed.paperOriginY;
-    plotter::kit::addBuiltinPaperPresets(paperPresets);
-    paperPresets.loadUserFromDataPath("settings/PaperPresets.json");
     plotter::kit::addBuiltinEnvelopePresets(envelopePresets);
     envelopePresets.loadUserFromDataPath("settings/EnvelopePresets.json");
     plotter::kit::addBuiltinPipelinePresets(pipelinePresets);
     pipelinePresets.loadUserFromDataPath("settings/PipelinePresets.json");
     plotter::kit::addBuiltinPenPresets(penPresets);
     penPresets.loadUserFromDataPath("settings/PenPresets.json");
+    plotter::kit::addBuiltinInjectionsPresets(injectionPresets);
+    injectionPresets.loadUserFromDataPath("settings/InjectionPresets.json");
 
     m_snippetCatalog.ensureDefaults();
 
@@ -346,8 +381,18 @@ void ofApp::setup()
     m_zonesPanel.setRegistry(&m_registry);
     m_zonesPanel.setZoneStore(&m_zones);
     m_zonesPanel.setPrefs(&machinePrefs);
+    m_zonesPanel.setPlotDoc(&m_plotDoc);
+    m_zonesPanel.setDefaultPenWidthMm(m_plotDoc.pen.penWidth);
     // false: do not reimport source G-code on every zone tweak (breaks live ImGui edits).
     m_zonesPanel.setOnDrawTargetChanged([this] { syncDrawTarget(false); });
+    m_zonesPanel.setOnCropmarksGenerated([this](entt::entity layer) {
+        m_zonesPanel.setDefaultPenWidthMm(m_plotDoc.pen.penWidth);
+        m_plotDoc.markCanvasDirty();
+        if (layer != entt::null)
+            ofkitty::runtime().select(layer);
+        markPrepareDirty("Cropmarks layer updated — press Update/Generate");
+        markProjectDirty();
+    });
 
     m_panel.setRegistry(&m_registry);
 
@@ -381,7 +426,43 @@ void ofApp::setup()
     m_injectionsPanel.setZoneStore(&m_zones);
     m_injectionsPanel.setSnippetCatalog(&m_snippetCatalog);
     m_injectionsPanel.setOnChanged([this] {
-        markPrepareDirty("Injections changed — press Update/Generate");
+        markPrepareDirty("Injections changed — updating preview…");
+        ++m_toolpathPreviewRev;
+        if (useInjections && liveSourceValid && !liveSourceGcode.empty())
+            requestPrepare();
+    });
+    m_injectionsPanel.setDrawPresetFooter([this] {
+        if (injectionPresets.drawPicker(
+                "injections",
+                [this] { return plotter::kit::injectionsPresetJson(m_registry); },
+                [this](const ofJson& j) {
+                    plotter::kit::applyInjectionsPreset(m_registry, j);
+                },
+                plotter::kit::injectionsPresetEquals)) {
+            markPrepareDirty("Injections preset applied — press Update/Generate");
+            ++m_toolpathPreviewRev;
+            markProjectDirty();
+            if (useInjections && liveSourceValid && !liveSourceGcode.empty())
+                requestPrepare();
+        }
+    });
+
+    m_envelopePanel.setPrefs(&machinePrefs);
+    m_envelopePanel.setPresets(&envelopePresets);
+    m_envelopePanel.setOnChanged([this] {
+        machinePrefs.bed.paperOriginX = paperOriginX;
+        machinePrefs.bed.paperOriginY = paperOriginY;
+        machinePrefs.save();
+        syncMainViewContentSize();
+        markPrepareDirty("Machine settings changed — press Update/Generate");
+        if (!m_panel.sourceText().empty())
+            syncToolpathPreview(m_panel.sourceText());
+        else if (liveSourceValid)
+            syncToolpathPreview(transformedSourceText());
+    });
+    m_envelopePanel.setDrawFooter([this] {
+        if (ImGui::Button("Open USB Serial (Bed Layout)", ImVec2(-1.f, 0.f)))
+            ofkitty::runtime().setWindowVisible("USB Serial", true);
     });
 
     m_plotDoc.pen.penDownZ    = 0.f;
@@ -481,6 +562,7 @@ void ofApp::setup()
         in.showLeadBounds = &m_showLeadBounds;
         in.landingColor = &m_landingColor;
         in.leadBoundsColor = &m_leadBoundsColor;
+        in.useInjections = &useInjections;
         m_toolpath3D.setInputs(std::move(in));
     }
     m_toolpath3D.setup();
@@ -636,8 +718,9 @@ void ofApp::draw()
     auto& v = m_view->view2D;
     v.updateDerived();
     ofPushMatrix();
+    ofDisableDepthTest(); // 2D bed view — never treat travel Z as height
     ofTranslate(v.ox, v.oy);
-    ofScale(v.zoom_, v.zoom_);
+    ofScale(v.zoom_, v.zoom_, 1.f);
     // Keep the panel/doc field in sync with View → Show Mark (presets / .ofdoc).
     m_panel.scaleStrokeToPenWidth = m_showMark;
 
@@ -663,13 +746,41 @@ void ofApp::draw()
     opts.drawMeshCache   = &m_drawMeshCache;
     opts.travelMeshCache = &m_travelMeshCache;
     if (m_showLeadBounds) {
-        const auto bed = plotter::BedView::fromPrefs(machinePrefs);
         opts.showLeadBounds = true;
-        opts.leadBounds = plotter::computeLeadBoundsFromPaperPaths(
-            m_plotDoc.getPaths(), bed, m_plotDoc.pen);
+        opts.leadBounds = plotter::computeLeadBoundsForPreview(
+            m_panel.hasGeometry() ? &m_panel.drawPaths() : nullptr,
+            m_panel.hasGeometry() ? &m_panel.travelPaths() : nullptr,
+            buildPreviewBounds(),
+            m_plotDoc.getPaths(),
+            plotter::BedView::fromPrefs(machinePrefs),
+            m_plotDoc.pen,
+            &m_landingPads);
         opts.leadBoundsColor = m_leadBoundsColor;
     }
     plotter::kit::drawGcodeSenderScene(m_plotDoc, m_zones, m_registry, machinePrefs, opts);
+
+    if (useInjections && prepareDirty && liveSourceValid
+        && (m_showToolpath || m_showMark)) {
+        const plotter::PreviewBounds pb = buildPreviewBounds();
+        ofPushStyle();
+        ofNoFill();
+        ofSetLineWidth(1.5f);
+        for (const auto& prev : plotter::collectInjectionSnippetPreviews(
+                 m_registry, m_plotDoc.pen)) {
+            ofSetColor(prev.color);
+            for (const auto& sp : prev.machinePaths) {
+                const auto& verts = sp.getVertices();
+                if (verts.size() < 2) continue;
+                ofPolyline content;
+                for (const auto& vtx : verts) {
+                    const glm::vec2 c = pb.machineToContent(vtx.x, vtx.y);
+                    content.addVertex(c.x, c.y, 0.f);
+                }
+                content.draw();
+            }
+        }
+        ofPopStyle();
+    }
 
     if (m_showLandingPads && m_plotDoc.pen.smoothApproach)
         drawLandingPads(v.zoom_);
@@ -1335,11 +1446,15 @@ void ofApp::setupUi()
     serialWindow.setUsbSerialWindowTitle("USB Serial###gcode_sender_usb");
     serialWindow.setConsoleWindowTitle("Serial Console###gcode_sender_console");
 
+    m_envelopePanel.setImGuiWindowTitle(kEnvelopeWindow);
+
     ofkitty::runtime().registerWindow({
         "Controls", "View", true, true,
         [this](bool& v) { drawControlPanel(v); },
         "gcode_sender_controls"
     });
+    plotter::kit::registerWindow(ofkitty::runtime(), m_envelopePanel,
+                                 { true, true, true, "Machine Envelope", "gcode_sender_envelope" });
     plotter::kit::registerWindow(ofkitty::runtime(), m_zonesPanel,
                                  { true, true, true, "Zones", "gcode_sender_zones" });
     plotter::kit::registerWindow(ofkitty::runtime(), m_pipelinePanel,
@@ -1362,9 +1477,9 @@ void ofApp::setupUi()
         { true, false, false, "Serial Console", "gcode_sender_console" });
 
     // Fallback when no imgui.ini exists (imgui.default.ini is preferred).
-    // Mirrors the shipped layout: Controls left; G-code + Toolpath 3D right;
-    // Zones / Injections / Pipeline also available from View.
-    ofkitty::runtime().addDefaultLayoutLeftDockTop(kControlsWindow);
+    // Left: Machine Envelope above Controls (settings).
+    ofkitty::runtime().addDefaultLayoutLeftDockTop(kEnvelopeWindow);
+    ofkitty::runtime().addDefaultLayoutLeftDock(kControlsWindow);
     ofkitty::runtime().addDefaultLayoutLeftDock(kZonesWindow);
     ofkitty::runtime().addDefaultLayoutLeftDock("Injections###gcode_sender_injections");
     ofkitty::runtime().addDefaultLayoutLeftDock(plotter::kit::kImGuiTitlePipeline);
@@ -1438,83 +1553,8 @@ void ofApp::drawControlPanel(bool& visible)
         ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed;
 
     const float fieldW = controlFieldWidth(15);
-    bool changed = false;
 
     drawFileDropzone();
-
-    if (ImGui::CollapsingHeader("Machine Envelope", sectionFlags)) {
-        if (envelopePresets.drawPicker(
-                "envelope",
-                [this] {
-                    return plotter::kit::envelopePresetJson(
-                        machinePrefs.envelope.minX, machinePrefs.envelope.minY,
-                        machinePrefs.envelope.maxX, machinePrefs.envelope.maxY);
-                },
-                [this, &changed](const ofJson& j) {
-                    machinePrefs.envelope.minX = j["minX"].get<float>();
-                    machinePrefs.envelope.minY = j["minY"].get<float>();
-                    machinePrefs.envelope.maxX = j["maxX"].get<float>();
-                    machinePrefs.envelope.maxY = j["maxY"].get<float>();
-                    machinePrefs.save();
-                    changed = true;
-                },
-                plotter::kit::envelopePresetEquals)) {
-            changed = true;
-        }
-
-        const float envW = machinePrefs.envelope.maxX - machinePrefs.envelope.minX;
-        const float envH = machinePrefs.envelope.maxY - machinePrefs.envelope.minY;
-        ImGui::TextDisabled("Size %.0f x %.0f mm", envW, envH);
-
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Min X", &machinePrefs.envelope.minX, 1.f, -5000.f, 5000.f, "%.0f mm");
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Min Y", &machinePrefs.envelope.minY, 1.f, -5000.f, 5000.f, "%.0f mm");
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Max X", &machinePrefs.envelope.maxX, 1.f, -5000.f, 5000.f, "%.0f mm");
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Max Y", &machinePrefs.envelope.maxY, 1.f, -5000.f, 5000.f, "%.0f mm");
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Min Z", &machinePrefs.envelope.minZ, 0.5f, -500.f, 500.f, "%.1f mm");
-        ImGui::SetNextItemWidth(fieldW);
-        changed |= ImGui::DragFloat("Max Z", &machinePrefs.envelope.maxZ, 0.5f, -500.f, 500.f, "%.1f mm");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Software Z travel limits (machine mm). Sends are refused when any\n"
-                "move (incl. pen up/down and snippets) would leave this range.");
-
-        bool invX = machinePrefs.axes.signX < 0.f;
-        bool invY = machinePrefs.axes.signY < 0.f;
-        if (ImGui::Checkbox("Invert +X", &invX)) {
-            machinePrefs.axes.signX = invX ? -1.f : 1.f;
-            changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "When checked, positive paper X travels toward decreasing machine X.\n"
-                "Paper origin still sets where paper (0,0) sits in machine mm.");
-        if (ImGui::Checkbox("Invert +Y", &invY)) {
-            machinePrefs.axes.signY = invY ? -1.f : 1.f;
-            changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "When checked, positive paper Y travels toward decreasing machine Y.\n"
-                "Paper origin still sets where paper (0,0) sits in machine mm.");
-        bool invZ = machinePrefs.axes.signZ < 0.f;
-        if (ImGui::Checkbox("Invert +Z", &invZ)) {
-            machinePrefs.axes.signZ = invZ ? -1.f : 1.f;
-            changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "For machines whose Z zero is the top of travel (pen up = negative Z).\n"
-                "The app keeps working with pen up = +Z; every Z in the outgoing\n"
-                "G-code (send/export) gets its sign flipped.");
-
-        if (ImGui::Button("Open USB Serial (Bed Layout)", ImVec2(-1.f, 0.f)))
-            ofkitty::runtime().setWindowVisible("USB Serial", true);
-    }
 
     if (ImGui::CollapsingHeader("Pen", sectionFlags)) {
         bool penExportChanged = false;
@@ -1647,14 +1687,20 @@ void ofApp::drawControlPanel(bool& visible)
         }
 
         {
-            const auto bed = plotter::BedView::fromPrefs(machinePrefs);
-            const plotter::LeadBounds lb = plotter::computeLeadBoundsFromPaperPaths(
-                m_plotDoc.getPaths(), bed, m_plotDoc.pen);
+            const plotter::LeadBounds lb = plotter::computeLeadBoundsForPreview(
+                m_panel.hasGeometry() ? &m_panel.drawPaths() : nullptr,
+                m_panel.hasGeometry() ? &m_panel.travelPaths() : nullptr,
+                buildPreviewBounds(),
+                m_plotDoc.getPaths(),
+                plotter::BedView::fromPrefs(machinePrefs),
+                m_plotDoc.pen,
+                &m_landingPads);
             ImGui::Checkbox("Show Lead bounds", &m_showLeadBounds);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
-                    "Artwork bounding box plus Approach/Retract overshoot in\n"
-                    "machine mm. Align this box to the bed before running.");
+                    "Job footprint in machine mm (preview paths + Approach/Retract).\n"
+                    "Matches the Mark/Toolpath view, including Output transforms.\n"
+                    "Align this box to the bed before running.");
             if (m_showLeadBounds) {
                 ImGui::SameLine();
                 ImGui::ColorEdit4("Bounds color", (float*)&m_leadBoundsColor,
@@ -1719,52 +1765,7 @@ void ofApp::drawControlPanel(bool& visible)
         }
     }
 
-    if (ImGui::CollapsingHeader("Paper", sectionFlags)) {
-        m_zonesPanel.drawTargetZonePicker();
-
-        // Draw-target zone is the source of truth (same as Properties). Mirror fields
-        // alone were overwritten by syncToolpathPreview / settingsDirty reimport.
-        plotter::machine_zone_component* zone = nullptr;
-        {
-            const entt::entity target = m_zones.findDrawTargetZone(m_registry);
-            if (target != entt::null)
-                zone = m_registry.try_get<plotter::machine_zone_component>(target);
-        }
-
-        if (!zone) {
-            ImGui::TextDisabled("No draw-target zone — pick or create one above.");
-        } else {
-            if (paperPresets.drawPicker(
-                    "paper",
-                    [zone] {
-                        return plotter::kit::paperPresetJson(zone->x, zone->y, zone->w, zone->h);
-                    },
-                    [this, zone](const ofJson& j) {
-                        zone->x = j["paperOriginX"].get<float>();
-                        zone->y = j["paperOriginY"].get<float>();
-                        zone->w = std::max(10.f, j["paperW"].get<float>());
-                        zone->h = std::max(10.f, j["paperH"].get<float>());
-                        syncDrawTarget(false);
-                    },
-                    plotter::kit::paperPresetEquals)) {
-                // apply already synced
-            }
-
-            bool paperChanged = false;
-            ImGui::SetNextItemWidth(fieldW);
-            paperChanged |= ImGui::DragFloat("Origin X", &zone->x, 1.f, -500.f, 5000.f, "%.0f mm");
-            ImGui::SetNextItemWidth(fieldW);
-            paperChanged |= ImGui::DragFloat("Origin Y", &zone->y, 1.f, -500.f, 5000.f, "%.0f mm");
-            ImGui::SetNextItemWidth(fieldW);
-            paperChanged |= ImGui::DragFloat("Paper W",  &zone->w, 1.f, 10.f, 5000.f, "%.0f mm");
-            ImGui::SetNextItemWidth(fieldW);
-            paperChanged |= ImGui::DragFloat("Paper H",  &zone->h, 1.f, 10.f, 5000.f, "%.0f mm");
-            if (paperChanged)
-                syncDrawTarget(false);
-        }
-    }
-
-    if (ImGui::CollapsingHeader("Source Output", sectionFlags)) {
+    if (ImGui::CollapsingHeader("Source placement", sectionFlags)) {
         const float labelColW = labelColumnWidth(
             { "Offset X", "Offset Y", "Scale X", "Scale Y", "Rotate" });
 
@@ -1801,6 +1802,7 @@ void ofApp::drawControlPanel(bool& visible)
     if (ImGui::CollapsingHeader("Injections", sectionFlags)) {
         if (ImGui::Checkbox("Use Injections", &useInjections)) {
             syncExportSessionFlags();
+            ++m_toolpathPreviewRev;
             markPrepareDirty(useInjections ? "Injections enabled — press Update/Generate"
                                            : "Injections disabled — press Update/Generate");
         }
@@ -1838,16 +1840,6 @@ void ofApp::drawControlPanel(bool& visible)
 
     if (ImGui::Button(ICON_FA_SAVE " Export prepared G-code…", ImVec2(-1.f, 0.f)))
         savePreparedGcode();
-
-    if (changed) {
-        machinePrefs.bed.paperOriginX = paperOriginX;
-        machinePrefs.bed.paperOriginY = paperOriginY;
-        machinePrefs.save();
-        syncMainViewContentSize();
-        markPrepareDirty("Machine settings changed — press Update/Generate");
-        // Do not set settingsDirty here: update() reimports the whole source file and
-        // resets ImGui drag/input state (and used to clobber paper size from the zone).
-    }
 
     ImGui::End();
 }

@@ -4,6 +4,8 @@
 #include "PresetPicker.h"
 #include "ofxPlotProcessors.h"
 
+#include <entt.hpp>
+
 namespace plotter::kit {
 
 /// Built-in ISO paper sizes (origin + width/height in mm).
@@ -32,5 +34,11 @@ void   applyPenPreset(const ofJson& j,
                       bool& scaleStrokeToPenWidth);
 bool   penPresetEquals(const ofJson& a, const ofJson& b);
 void   addBuiltinPenPresets(ofkitty::PresetLibrary& lib);
+
+/// Injection *rules* only (not zones). Snippet bodies stay on disk by path.
+ofJson injectionsPresetJson(const entt::registry& reg);
+void   applyInjectionsPreset(entt::registry& reg, const ofJson& j);
+bool   injectionsPresetEquals(const ofJson& a, const ofJson& b);
+void   addBuiltinInjectionsPresets(ofkitty::PresetLibrary& lib);
 
 } // namespace plotter::kit

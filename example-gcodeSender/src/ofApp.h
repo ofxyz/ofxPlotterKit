@@ -79,10 +79,10 @@ private:
     /// toolpath. Drawn in content mm; @p zoom is View2D px-per-mm for marker sizing.
     void drawLandingPads(float zoom);
 
-    ofkitty::PresetLibrary paperPresets;
     ofkitty::PresetLibrary envelopePresets;
     ofkitty::PresetLibrary pipelinePresets;
     ofkitty::PresetLibrary penPresets;
+    ofkitty::PresetLibrary injectionPresets;
     plotter::kit::PlotterSnippetCatalog m_snippetCatalog;
 
     float paperOriginX = 0.f;
@@ -106,6 +106,7 @@ private:
     plotter::kit::PlotterZonesPanel   m_zonesPanel;
     plotter::kit::PlotterPipelinePanel m_pipelinePanel;
     plotter::kit::PlotterInjectionsPanel m_injectionsPanel;
+    plotter::kit::PlotterEnvelopePanel m_envelopePanel;
     ofkitty::LayersPanel m_layersPanel;
 
     ofxDocumentKit::ofxDocumentKit m_docKit;

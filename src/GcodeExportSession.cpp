@@ -67,9 +67,13 @@ bool GcodeExportSession::syncPlotDocFromSource(const std::string& text)
     if (!m_doc->parseGCodeDocument(text, doc, importOpts, false))
         return false;
 
-    m_doc->resetCanvas();
+    // false: do not seed an empty "Layer 1" — placeSvgDocument creates the
+    // content layers. An empty default would otherwise stick around after import.
+    m_doc->resetCanvas(/*createDefaultLayer=*/false);
     if (m_zones) m_doc->setDrawTargetSource(m_zones);
     m_doc->placeSvgDocument(doc, PlotDoc::SvgScaleMode::ActualSize);
+    if (m_doc->layerOrder.empty())
+        m_doc->addLayer("Layer 1");
     m_doc->rebuildFlatPaths();
     m_doc->refreshStats();
     return true;
@@ -78,8 +82,19 @@ bool GcodeExportSession::syncPlotDocFromSource(const std::string& text)
 plotproc::StrokeDocument GcodeExportSession::buildStrokeDocFromSource(const std::string& text)
 {
     plotproc::StrokeDocument empty;
-    if (!syncPlotDocFromSource(text)) return empty;
-    return m_doc->toStrokeDocument();
+    if (!m_doc || text.empty()) return empty;
+
+    // Prepare must not mutate the live layer stack. Previously this called
+    // syncPlotDocFromSource → resetCanvas(), which recreated "Layer 1" and
+    // wiped user deletes on every Update/Generate.
+    PlotDoc::SvgDocument parsed;
+    GCodeImportOptions importOpts;
+    importOpts.fitBeziers = false;
+    importOpts.penDownMaxZ = (m_doc->pen.penDownZ + m_doc->pen.penUpZ) * 0.5f;
+    if (!m_doc->parseGCodeDocument(text, parsed, importOpts, false))
+        return empty;
+
+    return m_doc->strokeDocumentFromParsed(parsed, PlotDoc::SvgScaleMode::ActualSize);
 }
 
 std::string GcodeExportSession::finalizeGcodeFromStrokeDoc(plotproc::StrokeDocument& doc,

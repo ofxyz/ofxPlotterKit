@@ -22,16 +22,19 @@ void drawGcodeSenderScene(PlotDoc& doc,
         const glm::vec2 paper = doc.getPaperSizeMM();
         const glm::vec2 envMin = pb.machineToContent(prefs.envelope.minX, prefs.envelope.minY);
 
+        float paperMinX = paperOrigin.x, paperMinY = paperOrigin.y, paperW = paper.x, paperH = paper.y;
+        paperRectContent(bed, pb, paper.x, paper.y, paperMinX, paperMinY, paperW, paperH);
+
         drawPrintPreviewBed(envMin.x, envMin.y,
                             prefs.envelope.spanX(), prefs.envelope.spanY(),
-                            paperOrigin.x, paperOrigin.y,
-                            paper.x, paper.y,
+                            paperMinX, paperMinY,
+                            paperW, paperH,
                             opts.bedColor, opts.paperColor);
 
         if (opts.showLeadBounds && opts.leadBounds.valid) {
-            const glm::vec2 cMin = pb.machineToContent(opts.leadBounds.minX, opts.leadBounds.minY);
-            const glm::vec2 sz = opts.leadBounds.size();
-            drawPrintPreviewLeadBounds(cMin.x, cMin.y, sz.x, sz.y, opts.leadBoundsColor);
+            float cMinX = 0.f, cMinY = 0.f, cW = 0.f, cH = 0.f;
+            leadBoundsToContentRect(opts.leadBounds, pb, cMinX, cMinY, cW, cH);
+            drawPrintPreviewLeadBounds(cMinX, cMinY, cW, cH, opts.leadBoundsColor);
         }
 
         // Zone outlines only for non–draw-target zones (paper fill already shows Canvas).
@@ -51,9 +54,9 @@ void drawGcodeSenderScene(PlotDoc& doc,
         }
         ofPopStyle();
     } else if (opts.showLeadBounds && opts.leadBounds.valid) {
-        const glm::vec2 cMin = pb.machineToContent(opts.leadBounds.minX, opts.leadBounds.minY);
-        const glm::vec2 sz = opts.leadBounds.size();
-        drawPrintPreviewLeadBounds(cMin.x, cMin.y, sz.x, sz.y, opts.leadBoundsColor);
+        float cMinX = 0.f, cMinY = 0.f, cW = 0.f, cH = 0.f;
+        leadBoundsToContentRect(opts.leadBounds, pb, cMinX, cMinY, cW, cH);
+        drawPrintPreviewLeadBounds(cMinX, cMinY, cW, cH, opts.leadBoundsColor);
     }
 
     if (!opts.showPaths) return;
@@ -105,8 +108,8 @@ void drawGcodeSenderScene(PlotDoc& doc,
                 for (const auto& p : *opts.contentTravelPaths) {
                     const auto& verts = p.getVertices();
                     for (size_t v = 0; v + 1 < verts.size(); ++v) {
-                        mesh.addVertex(verts[v]);
-                        mesh.addVertex(verts[v + 1]);
+                        mesh.addVertex({ verts[v].x, verts[v].y, 0.f });
+                        mesh.addVertex({ verts[v + 1].x, verts[v + 1].y, 0.f });
                         mesh.addColor(col);
                         mesh.addColor(col);
                     }
@@ -159,6 +162,8 @@ void drawGcodeSenderScene(PlotDoc& doc,
     }
 
     // Fallback: PlotDoc paths are paper-local (placeSvgDocument).
+    // Translate by paper origin only — path vertices stay paper-local; Invert
+    // ±X/±Y is applied when exporting / preparing, not in this fallback draw.
     ofPushMatrix();
     ofTranslate(paperOrigin.x, paperOrigin.y);
     const auto& paths = doc.getPaths();

@@ -1,9 +1,9 @@
 #include "PlotterInjectionsPanel.h"
 #include "PlotterSnippetUi.h"
-#include "ReorderDragDrop.h"
 #include "IconsFontAwesome5.h"
 #include "imgui.h"
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -156,6 +156,7 @@ void PlotterInjectionsPanel::drawRuleSnippetPicker(entt::entity ruleEntity,
             r.snippetCatalogId.clear();
             r.snippetEntity = entt::null;
             m_ruleSnippetEditors.erase(ruleKey);
+            m_snippetEditorOpen.erase(ruleKey);
         } else if (combo == kNewIdx) {
             const std::string name = m_snippetCatalog->createCustomSnippet(
                 "inject_" + std::to_string((unsigned long long)ruleKey) + ".gcode");
@@ -163,11 +164,13 @@ void PlotterInjectionsPanel::drawRuleSnippetPicker(entt::entity ruleEntity,
             r.snippetCatalogId    = name;
             r.snippetEntity       = entt::null;
             m_ruleSnippetEditors.erase(ruleKey);
+            m_snippetEditorOpen.erase(ruleKey);
         } else {
             const auto& picked = snippets[(size_t)combo - 1];
             r.snippetEntity    = entt::null;
             r.snippetCatalogId = picked.id;
             m_ruleSnippetEditors.erase(ruleKey);
+            m_snippetEditorOpen.erase(ruleKey);
             if (picked.isBuiltin) {
                 r.snippetResourceName = snippetSettingsPath(
                     "inject_" + std::to_string((unsigned long long)ruleKey) + ".gcode");
@@ -181,22 +184,50 @@ void PlotterInjectionsPanel::drawRuleSnippetPicker(entt::entity ruleEntity,
     }
 
     if (!r.snippetResourceName.empty()) {
-        // TextEditor is expensive; keep it behind a nested header so expanding a
-        // rule to tweak When/Mode does not render a full G-code editor every frame.
-        // ImGui also persists CollapsingHeader open state — an always-on editor
-        // here is what made FPS never recover after configuring injections.
-        if (ImGui::CollapsingHeader("Edit snippet G-code")) {
-            auto& editorState = m_ruleSnippetEditors[ruleKey];
-            if (drawSnippetEditor("##ruleSnippet", r.snippetResourceName, editorState))
-                notifyChanged();
-        } else if (auto it = m_ruleSnippetEditors.find(ruleKey); it != m_ruleSnippetEditors.end()) {
-            // Flush pending edits, then drop the editor so undo buffers don't linger.
-            auto& st = it->second;
-            if (!st.editKey.empty() && st.editor.GetUndoIndex() != st.savedUndoIdx) {
-                writeSnippetFile(st.editKey, st.editor.GetText());
-                notifyChanged();
+        const bool editorOpen = m_snippetEditorOpen.count(ruleKey) > 0;
+        if (ImGui::Button(editorOpen ? "Hide snippet G-code" : "Edit snippet G-code")) {
+            if (editorOpen) {
+                // Flush then tear down so TextEditor cost cannot linger.
+                if (auto it = m_ruleSnippetEditors.find(ruleKey); it != m_ruleSnippetEditors.end()) {
+                    auto& st = it->second;
+                    if (!st.editKey.empty() && st.editor.GetUndoIndex() != st.savedUndoIdx) {
+                        writeSnippetFile(st.editKey, st.editor.GetText());
+                        notifyChanged();
+                    }
+                    m_ruleSnippetEditors.erase(it);
+                }
+                m_snippetEditorOpen.erase(ruleKey);
+            } else {
+                m_snippetEditorOpen.insert(ruleKey);
             }
-            m_ruleSnippetEditors.erase(it);
+        }
+
+        if (editorOpen) {
+            auto& editorState = m_ruleSnippetEditors[ruleKey];
+            bool createdNew = false;
+            auto onNewSnippet = [&]() {
+                if (!m_snippetCatalog) return;
+                // Flush the open buffer before switching files.
+                if (!editorState.editKey.empty()
+                    && editorState.editor.GetUndoIndex() != editorState.savedUndoIdx) {
+                    writeSnippetFile(editorState.editKey, editorState.editor.GetText());
+                }
+                const std::string name = m_snippetCatalog->createCustomSnippet(
+                    "inject_" + std::to_string((unsigned long long)ruleKey) + ".gcode");
+                if (name.empty()) return;
+                r.snippetResourceName = snippetSettingsPath(name);
+                r.snippetCatalogId    = name;
+                r.snippetEntity       = entt::null;
+                createdNew = true; // tear down after draw — st is still in use
+                notifyChanged();
+            };
+            if (drawSnippetEditor("##ruleSnippet", r.snippetResourceName, editorState,
+                                  onNewSnippet))
+                notifyChanged();
+            if (createdNew) {
+                m_ruleSnippetEditors.erase(ruleKey);
+                m_snippetEditorOpen.insert(ruleKey);
+            }
         }
 
         if (ImGui::SmallButton("Duplicate")) {
@@ -207,6 +238,7 @@ void PlotterInjectionsPanel::drawRuleSnippetPicker(entt::entity ruleEntity,
                 r.snippetResourceName = snippetSettingsPath(newId);
                 r.snippetEntity       = entt::null;
                 m_ruleSnippetEditors.erase(ruleKey);
+                m_snippetEditorOpen.erase(ruleKey);
                 notifyChanged();
             }
         }
@@ -252,6 +284,7 @@ void PlotterInjectionsPanel::drawRuleSnippetPicker(entt::entity ruleEntity,
                     r.snippetCatalogId    = newId;
                     r.snippetResourceName = snippetSettingsPath(newId);
                     m_ruleSnippetEditors.erase(ruleKey);
+                    m_snippetEditorOpen.erase(ruleKey);
                     notifyChanged();
                 }
                 ImGui::CloseCurrentPopup();
@@ -272,13 +305,15 @@ void PlotterInjectionsPanel::drawInjectionRules()
 {
     auto& reg = *m_registry;
     const auto zoneEntities = plotter::collectZoneEntities(reg);
+    const auto ruleEntities = plotter::collectInjectionRuleEntities(reg);
+
     if (ImGui::Button("Add rule")) {
         plotter::injection_rule_component r;
         if (!zoneEntities.empty()) {
             const auto& mc = reg.get<plotter::machine_zone_component>(zoneEntities.front());
             r.zoneId = mc.zoneId;
         }
-        const int sortOrder = (int)plotter::collectInjectionRuleEntities(reg).size();
+        const int sortOrder = (int)ruleEntities.size();
         const entt::entity e = plotter::createInjectionRuleEntity(reg, std::move(r), sortOrder);
         auto& created = reg.get<plotter::injection_rule_component>(e);
         created.snippetResourceName = snippetSettingsPath(
@@ -290,113 +325,129 @@ void PlotterInjectionsPanel::drawInjectionRules()
         m_zones->save(reg);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Persist rules (including order) to the zones store.");
-    ImGui::TextDisabled("Drag a rule header to reorder.\n"
-                        "Order is the emission sequence for At start / At end.");
+
+    if (m_drawPresetFooter) {
+        ImGui::Spacing();
+        m_drawPresetFooter();
+    }
+
+    ImGui::TextDisabled("Drag a rule header to reorder. Order is the emission\n"
+                        "sequence for At start / At end.");
 
     auto renumberRules = [&](const std::vector<entt::entity>& order) {
         for (int i = 0; i < (int)order.size(); ++i)
             reg.get<plotter::injection_rule_component>(order[(size_t)i]).sortOrder = i;
     };
 
-    /// Move rule at @p from to insert index @p to in the post-erase list.
-    auto moveRule = [&](int from, int to) {
-        auto order = plotter::collectInjectionRuleEntities(reg);
-        if (from < 0 || from >= (int)order.size())
-            return;
+    // Fresh list after Add (entity vector above may be stale).
+    const auto rules = plotter::collectInjectionRuleEntities(reg);
+
+    m_rulesEditor.setPayloadTag("INJECT_RULE_IDX");
+    m_rulesEditor.setShowDragHandle(false); // drag the collapsing header itself
+    m_rulesEditor.setShowAddRow(false);
+    m_rulesEditor.setDefaultOpen(false);    // keep bodies closed until needed (FPS)
+    m_rulesEditor.setFooterHint({});
+    m_rulesEditor.setStepCount((int)rules.size());
+
+    m_rulesEditor.setStepLabel([this, &reg, &rules](int i) -> std::string {
+        if (i < 0 || i >= (int)rules.size()) return "Rule";
+        return ruleHeaderLabel(reg.get<plotter::injection_rule_component>(rules[(size_t)i]), reg);
+    });
+
+    m_rulesEditor.setIsEnabled([this, &reg, &rules](int i) {
+        if (i < 0 || i >= (int)rules.size()) return false;
+        return reg.get<plotter::injection_rule_component>(rules[(size_t)i]).enabled;
+    });
+    m_rulesEditor.setSetEnabled([this, &reg, &rules](int i, bool on) {
+        if (i < 0 || i >= (int)rules.size()) return;
+        reg.get<plotter::injection_rule_component>(rules[(size_t)i]).enabled = on;
+        notifyChanged();
+    });
+
+    m_rulesEditor.setOnMove([this, &reg, &rules, &renumberRules](int from, int to) {
+        // `to` is already the post-erase insert index (see ChainEditor).
+        if (from < 0 || from >= (int)rules.size()) return;
+        auto order = rules;
         const entt::entity moved = order[(size_t)from];
         order.erase(order.begin() + from);
         to = std::clamp(to, 0, (int)order.size());
         order.insert(order.begin() + to, moved);
         renumberRules(order);
         notifyChanged();
-    };
+    });
 
-    const auto ruleEntities = plotter::collectInjectionRuleEntities(reg);
-    for (int ri = 0; ri < (int)ruleEntities.size(); ++ri) {
-        const entt::entity ruleEntity = ruleEntities[(size_t)ri];
-        ImGui::PushID((int)(uintptr_t)ruleEntity);
+    m_rulesEditor.setOnRemove([this, &reg, &rules](int i) {
+        if (i < 0 || i >= (int)rules.size()) return;
+        const entt::entity e = rules[(size_t)i];
+        const auto key = (std::uintptr_t)e;
+        m_ruleSnippetEditors.erase(key);
+        m_snippetEditorOpen.erase(key);
+        if (reg.valid(e))
+            reg.destroy(e);
+        // Keep sortOrder dense after delete.
+        const auto remaining = plotter::collectInjectionRuleEntities(reg);
+        for (int ri = 0; ri < (int)remaining.size(); ++ri)
+            reg.get<plotter::injection_rule_component>(remaining[(size_t)ri]).sortOrder = ri;
+        notifyChanged();
+    });
+
+    m_rulesEditor.setDrawStepBody([this, &reg, &rules](int i) {
+        if (i < 0 || i >= (int)rules.size()) return;
+        const entt::entity ruleEntity = rules[(size_t)i];
+        if (!reg.valid(ruleEntity)) return;
         auto& r = reg.get<plotter::injection_rule_component>(ruleEntity);
 
-        const std::string headerLabel = ruleHeaderLabel(r, reg);
-        const std::string header = headerLabel + "###rule";
-        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-        const bool open = ImGui::CollapsingHeader(header.c_str());
-        const ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x,
-                            rowMin.y + ImGui::GetFrameHeight());
-
-        auto drop = ofkitty::ReorderDragDropIndexRow(
-            "INJECT_RULE_IDX", ri, headerLabel.c_str(), rowMin.y, rowMax.y + 4.f);
-        if (drop.accepted && drop.dragged != drop.target) {
-            int insert = drop.target;
-            if (drop.zone == ofkitty::DropZone::After)
-                insert = drop.target + 1;
-            if (drop.dragged < insert)
-                --insert;
-            moveRule(drop.dragged, insert);
-            ImGui::PopID();
-            break; // list order changed — redraw next frame
+        int whenIdx = 0;
+        if (r.when == plotter::InjectionWhen::AtStart) whenIdx = 1;
+        else if (r.when == plotter::InjectionWhen::AtEnd) whenIdx = 2;
+        if (ImGui::Combo("When", &whenIdx, "Every (mm)\0At start\0At end\0")) {
+            r.when = whenIdx == 1 ? plotter::InjectionWhen::AtStart
+                   : whenIdx == 2 ? plotter::InjectionWhen::AtEnd
+                                  : plotter::InjectionWhen::Interval;
+            notifyChanged();
         }
-        if (open) {
-            if (ImGui::Checkbox("Enabled", &r.enabled))
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Every (mm): along the toolpath by distance.\n"
+                "At start: once before the first stroke (paint load).\n"
+                "At end: once before M2 (cleanup / park).");
+
+        int modeIdx = r.mode == plotter::InjectionMode::Inline ? 1 : 0;
+        if (ImGui::Combo("Mode", &modeIdx, "Detour\0Inline\0")) {
+            r.mode = modeIdx == 1 ? plotter::InjectionMode::Inline
+                                  : plotter::InjectionMode::Detour;
+            notifyChanged();
+        }
+
+        if (r.when == plotter::InjectionWhen::Interval) {
+            ImGui::DragFloat("Every (mm)", &r.intervalMm, 5.f, 1.f, 100000.f, "%.0f");
+            if (ImGui::IsItemDeactivatedAfterEdit())
                 notifyChanged();
-
-            int whenIdx = 0;
-            if (r.when == plotter::InjectionWhen::AtStart) whenIdx = 1;
-            else if (r.when == plotter::InjectionWhen::AtEnd) whenIdx = 2;
-            if (ImGui::Combo("When", &whenIdx, "Every (mm)\0At start\0At end\0")) {
-                r.when = whenIdx == 1 ? plotter::InjectionWhen::AtStart
-                       : whenIdx == 2 ? plotter::InjectionWhen::AtEnd
-                                      : plotter::InjectionWhen::Interval;
+            if (ImGui::Checkbox("Count travel", &r.countTravel))
                 notifyChanged();
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "Every (mm): along the toolpath by distance.\n"
-                    "At start: once before the first stroke (paint load).\n"
-                    "At end: once before M2 (cleanup / park).");
-
-            int modeIdx = r.mode == plotter::InjectionMode::Inline ? 1 : 0;
-            if (ImGui::Combo("Mode", &modeIdx, "Detour\0Inline\0")) {
-                r.mode = modeIdx == 1 ? plotter::InjectionMode::Inline
-                                      : plotter::InjectionMode::Detour;
-                notifyChanged();
-            }
-
-            if (r.when == plotter::InjectionWhen::Interval) {
-                ImGui::DragFloat("Every (mm)", &r.intervalMm, 5.f, 1.f, 100000.f, "%.0f");
-                if (ImGui::IsItemDeactivatedAfterEdit())
-                    notifyChanged();
-                if (ImGui::Checkbox("Count travel", &r.countTravel))
-                    notifyChanged();
-                if (r.mode == plotter::InjectionMode::Detour) {
-                    if (ImGui::Checkbox("Between strokes", &r.betweenStrokes))
-                        notifyChanged();
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip(
-                            "Defer injection to the next pen lift before the interval\n"
-                            "is reached, rather than cutting mid-stroke.");
-                }
-            }
-
             if (r.mode == plotter::InjectionMode::Detour) {
-                drawZoneCombo("Zone", r.zoneId);
-                ImGui::InputInt("Position index", &r.positionIndex);
-                if (ImGui::IsItemDeactivatedAfterEdit())
+                if (ImGui::Checkbox("Between strokes", &r.betweenStrokes))
                     notifyChanged();
-            }
-
-            drawRuleSnippetPicker(ruleEntity, r);
-            if (ImGui::Button("Remove rule")) {
-                m_ruleSnippetEditors.erase((std::uintptr_t)ruleEntity);
-                reg.destroy(ruleEntity);
-                notifyChanged();
-                ImGui::PopID();
-                break;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Defer injection to the next pen lift before the interval\n"
+                        "is reached, rather than cutting mid-stroke.");
             }
         }
-        ImGui::PopID();
-    }
-    if (ruleEntities.empty())
+
+        if (r.mode == plotter::InjectionMode::Detour) {
+            drawZoneCombo("Zone", r.zoneId);
+            ImGui::InputInt("Position index", &r.positionIndex);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                notifyChanged();
+        }
+
+        drawRuleSnippetPicker(ruleEntity, r);
+    });
+
+    m_rulesEditor.draw();
+
+    if (rules.empty())
         ImGui::TextDisabled("No injection rules — Add rule for interval, start, or end.");
 }
 

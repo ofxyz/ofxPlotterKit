@@ -1,4 +1,5 @@
 #include "PlotterPresetData.h"
+#include "PlotterZones.h"
 
 namespace plotter::kit {
 
@@ -229,6 +230,69 @@ void addBuiltinPenPresets(ofkitty::PresetLibrary& lib)
     slow.slowTravels = true;
     lib.addBuiltin("Slow travels",
                    penPreset(slow, blueDrawColor(), false));
+}
+
+ofJson injectionsPresetJson(const entt::registry& reg)
+{
+    ofJson rulesJ = ofJson::array();
+    for (auto e : collectInjectionRuleEntities(reg)) {
+        if (!reg.valid(e) || !reg.all_of<injection_rule_component>(e)) continue;
+        rulesJ.push_back(injectionRuleToJson(reg.get<injection_rule_component>(e)));
+    }
+    return ofJson{ { "injectionRules", std::move(rulesJ) } };
+}
+
+void applyInjectionsPreset(entt::registry& reg, const ofJson& j)
+{
+    if (!j.is_object()) return;
+    destroyAllInjectionRuleEntities(reg);
+    if (!j.contains("injectionRules") || !j["injectionRules"].is_array())
+        return;
+    int sortOrder = 0;
+    for (const auto& rj : j["injectionRules"]) {
+        if (!rj.is_object()) continue;
+        createInjectionRuleEntity(reg, injectionRuleFromJson(rj, sortOrder), sortOrder);
+        ++sortOrder;
+    }
+}
+
+bool injectionsPresetEquals(const ofJson& a, const ofJson& b)
+{
+    return a == b;
+}
+
+void addBuiltinInjectionsPresets(ofkitty::PresetLibrary& lib)
+{
+    lib.addBuiltin("None (no rules)", ofJson{ { "injectionRules", ofJson::array() } });
+
+    injection_rule_component interval;
+    interval.enabled        = true;
+    interval.mode           = InjectionMode::Detour;
+    interval.when           = InjectionWhen::Interval;
+    interval.intervalMm     = 500.f;
+    interval.betweenStrokes = true;
+    interval.countTravel    = false;
+    interval.loopCount      = 1;
+    interval.zoneId         = {}; // user picks zone after apply
+    interval.snippetCatalogId = "zone_lines.gcode";
+    interval.snippetResourceName = "settings/snippets/zone_lines.gcode";
+
+    ofJson rules = ofJson::array();
+    rules.push_back(injectionRuleToJson(interval));
+    lib.addBuiltin("Interval detour (500 mm)",
+                   ofJson{ { "injectionRules", std::move(rules) } });
+
+    injection_rule_component atStart = interval;
+    atStart.when = InjectionWhen::AtStart;
+    atStart.intervalMm = 0.f;
+    atStart.betweenStrokes = false;
+    atStart.snippetCatalogId = "paint_dish_circle.gcode";
+    atStart.snippetResourceName = "settings/snippets/paint_dish_circle.gcode";
+
+    ofJson startRules = ofJson::array();
+    startRules.push_back(injectionRuleToJson(atStart));
+    lib.addBuiltin("At start — paint dish",
+                   ofJson{ { "injectionRules", std::move(startRules) } });
 }
 
 } // namespace plotter::kit
