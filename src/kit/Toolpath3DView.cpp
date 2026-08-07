@@ -170,8 +170,8 @@ void Toolpath3DView::updateScene()
         }
         const auto& lt = m_in.registry->get<ecs::LocalTransform>(e);
         mixModelF(lt.position.x); mixModelF(lt.position.y); mixModelF(lt.position.z);
-        mixModelF(lt.orientation.x); mixModelF(lt.orientation.y);
-        mixModelF(lt.orientation.z); mixModelF(lt.orientation.w);
+        mixModelF(lt.rotation.x); mixModelF(lt.rotation.y);
+        mixModelF(lt.rotation.z); mixModelF(lt.rotation.w);
         mixModelF(lt.scale.x); mixModelF(lt.scale.y); mixModelF(lt.scale.z);
     };
     if (m_showModels) {
